@@ -51,11 +51,13 @@ class Dinic:
         self.n = n
         self.g: list[list[_Edge]] = [[] for _ in range(n)]
 
-    def add_edge(self, u: int, v: int, cap: float) -> None:
+    def add_edge(self, u: int, v: int, cap: float) -> int:
+        """添加有向边，返回正向边在 ``g[u]`` 中的下标（便于回读实际流量）。"""
         fwd = _Edge(to=v, rev=len(self.g[v]), cap=float(cap))
         bak = _Edge(to=u, rev=len(self.g[u]), cap=0.0)
         self.g[u].append(fwd)
         self.g[v].append(bak)
+        return len(self.g[u]) - 1
 
     def _bfs(self, s: int, t: int) -> list[int]:
         level = [-1] * self.n
@@ -83,19 +85,21 @@ class Dinic:
             it[u] += 1
         return 0.0
 
-    def max_flow(self, s: int, t: int) -> float:
+    def max_flow(self, s: int, t: int, limit: float = float("inf")) -> float:
+        """求 s→t 最大流；给定 ``limit`` 时流量达到该上限即提前停止。"""
         flow = 0.0
         inf = float("inf")
-        while True:
+        while flow < limit - EPS:
             level = self._bfs(s, t)
             if level[t] < 0:
                 return flow
             it = [0] * self.n
-            while True:
-                pushed = self._dfs(s, t, inf, level, it)
+            while flow < limit - EPS:
+                pushed = self._dfs(s, t, min(inf, limit - flow), level, it)
                 if pushed <= EPS:
                     break
                 flow += pushed
+        return flow
 
     def reachable_from_source(self, s: int) -> list[bool]:
         """最大流计算后，沿残余容量 > 0 的边做 BFS，得到源侧节点集合。"""
@@ -133,7 +137,7 @@ def _finite_positive_number(raw, field: str) -> float:
     return value
 
 
-def audit_network(
+def _validate_draft(
     *,
     source: str,
     sink: str,
@@ -141,15 +145,16 @@ def audit_network(
     edges: list[dict],
     required_flow: float,
 ) -> dict:
-    """校验输入并执行正常网络 + 全部单点失效情景的最大流审计。
+    """按既有规则校验草稿，返回清洗后的节点 / 管段结构。
+
+    检修审计与低暴露配流单共用本校验，保证“提交配流单时先按既有
+    规则重新审计完整草稿”。
 
     ``nodes`` 为汇合节点（及其它中间节点）列表；泄压源与安全焚烧端
     自动并入节点集合。``edges`` 每项形如::
 
         {"id": "E1" | None, "from": "S", "to": "T",
          "capacity": 100.0, "maintainable": True}
-
-    返回可直接 JSON 序列化的审计结论（见模块 docstring 与 README）。
     """
     import math
 
@@ -222,6 +227,28 @@ def audit_network(
 
     all_nodes = sorted(node_set)
     index_of = {name: i for i, name in enumerate(all_nodes)}
+    return {
+        "source": source,
+        "sink": sink,
+        "required_flow": required_flow,
+        "junction_names": junction_names,
+        "edges": clean_edges,
+        "all_nodes": all_nodes,
+        "index_of": index_of,
+    }
+
+
+def audit_validated_draft(draft: dict) -> dict:
+    """在**已校验**的草稿上执行正常网络 + 全部单点失效情景的最大流审计。
+
+    返回可直接 JSON 序列化的审计结论（见模块 docstring 与 README）。
+    """
+    source = draft["source"]
+    sink = draft["sink"]
+    required_flow = draft["required_flow"]
+    clean_edges = draft["edges"]
+    all_nodes = draft["all_nodes"]
+    index_of = draft["index_of"]
 
     def _solve(removed_index: Optional[int]) -> tuple[float, dict]:
         """在一张**全新**的网络上独立求最大流，并返回流量与最小割证据。"""
@@ -324,6 +351,30 @@ def audit_network(
         "scenarios": scenarios,
         "failure": failure,
     }
+
+
+def audit_network(
+    *,
+    source: str,
+    sink: str,
+    nodes: list[str],
+    edges: list[dict],
+    required_flow: float,
+) -> dict:
+    """校验输入并执行正常网络 + 全部单点失效情景的最大流审计。
+
+    ``nodes`` 为汇合节点（及其它中间节点）列表；泄压源与安全焚烧端
+    自动并入节点集合。``edges`` 每项形如::
+
+        {"id": "E1" | None, "from": "S", "to": "T",
+         "capacity": 100.0, "maintainable": True}
+
+    返回可直接 JSON 序列化的审计结论（见模块 docstring 与 README）。
+    """
+    draft = _validate_draft(
+        source=source, sink=sink, nodes=nodes, edges=edges, required_flow=required_flow
+    )
+    return audit_validated_draft(draft)
 
 
 def _num(x: float) -> float:

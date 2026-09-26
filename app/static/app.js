@@ -1,8 +1,9 @@
 /* 事故导排网络检修审计 —— 前端逻辑
  *
  * 职责边界：前端只负责录入草稿与展示**服务端业务 API** 返回的结论，
- * 不在本地计算任何最大流 / 判定。草稿一旦在上次审计后被改动，旧结论
- * 立即标记为过期，不会被当作当前草稿的结果。
+ * 不在本地计算任何最大流 / 最小费用流 / 判定。草稿一旦在上次审计后
+ * 被改动，旧结论立即标记为过期；草稿或任一单位暴露代价在上次生成
+ * 配流单后被改动，旧配流单立即失效，都不会被当作当前草稿的结果。
  */
 (function () {
   "use strict";
@@ -11,25 +12,26 @@
 
   const state = {
     nodes: [],          // 汇合节点名称（不含源/汇）
-    edges: [],          // {id, from, to, capacity, maintainable}
-    lastAuditSignature: null,  // 上次成功提交时草稿的签名
+    edges: [],          // {id, from, to, capacity, cost, maintainable}
+    lastAuditSignature: null,  // 上次成功审计时草稿的签名（不含代价）
+    lastPlanSignature: null,   // 上次成功生成配流单时草稿的签名（含代价）
   };
 
   /* ---------------- 示例数据 ---------------- */
 
   // 达标示例：两条 100 容量干线在源/汇之间并联，要求 95，
-  // 任一可检修管段失效后仍至少剩 100 容量。
+  // 任一可检修管段失效后仍至少剩 100 容量；B 干线单位暴露代价更低。
   const EXAMPLE_PASS = {
     source: "泄压源V-101",
     sink: "焚烧炉F-1",
     required_flow: 95,
     nodes: ["汇合点A", "汇合点B"],
     edges: [
-      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, maintainable: true },
-      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 100, maintainable: true },
-      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E5", from: "汇合点A", to: "汇合点B", capacity: 40, maintainable: false },
+      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, cost: 2, maintainable: true },
+      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, cost: 2, maintainable: true },
+      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 100, cost: 1, maintainable: true },
+      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 100, cost: 1, maintainable: true },
+      { id: "E5", from: "汇合点A", to: "汇合点B", capacity: 40, cost: 0, maintainable: false },
     ],
   };
 
@@ -41,10 +43,10 @@
     required_flow: 95,
     nodes: ["汇合点A", "汇合点B"],
     edges: [
-      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, maintainable: true },
-      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 90, maintainable: true },
-      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 90, maintainable: true },
+      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, cost: 1, maintainable: true },
+      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, cost: 1, maintainable: true },
+      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 90, cost: 1, maintainable: true },
+      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 90, cost: 1, maintainable: true },
     ],
   };
 
@@ -121,6 +123,17 @@
       capInput.addEventListener("input", () => { edge.capacity = capInput.value; markDirty(); });
       tdCap.appendChild(capInput);
 
+      const tdCost = document.createElement("td");
+      const costInput = document.createElement("input");
+      costInput.type = "number";
+      costInput.min = "0";
+      costInput.step = "1";
+      costInput.value = edge.cost === "" || edge.cost === null || edge.cost === undefined ? "" : edge.cost;
+      costInput.placeholder = "非负整数";
+      costInput.title = "每单位流量穿过该管段的暴露代价（非负整数），仅用于低暴露配流单";
+      costInput.addEventListener("input", () => { edge.cost = costInput.value; markDirty(); });
+      tdCost.appendChild(costInput);
+
       const tdMaint = document.createElement("td");
       tdMaint.className = "center";
       const cb = document.createElement("input");
@@ -139,7 +152,7 @@
       delBtn.addEventListener("click", () => { state.edges.splice(i, 1); renderEdges(); markDirty(); });
       tdDel.appendChild(delBtn);
 
-      tr.append(tdNo, tdId, tdFrom, tdArrow, tdTo, tdCap, tdMaint, tdDel);
+      tr.append(tdNo, tdId, tdFrom, tdArrow, tdTo, tdCap, tdCost, tdMaint, tdDel);
       body.appendChild(tr);
     });
   }
@@ -149,8 +162,9 @@
     renderEdges();
   }
 
-  /* ---------------- 草稿状态 / 旧结论过期 ---------------- */
+  /* ---------------- 草稿状态 / 旧结论与旧配流单过期 ---------------- */
 
+  // 审计载荷：既有规则，不含单位暴露代价
   function currentPayload() {
     const required = $("in-required").value;
     return {
@@ -168,24 +182,46 @@
     };
   }
 
-  // 用稳定签名判断“草稿是否在上次审计后变化”
+  // 配流单载荷：在审计载荷基础上为每条管段附上单位暴露代价
+  function planPayload() {
+    const payload = currentPayload();
+    payload.edges.forEach((edge, i) => {
+      const raw = state.edges[i].cost;
+      edge.cost = raw === "" || raw === null || raw === undefined ? null : Number(raw);
+    });
+    return payload;
+  }
+
+  // 用稳定签名判断“草稿是否在上次审计/生成后被修改”
   function signature() {
     return JSON.stringify(currentPayload());
   }
 
+  function planSignature() {
+    return JSON.stringify(planPayload());
+  }
+
   function markDirty() {
-    if (state.lastAuditSignature === null) return;
-    const stale = signature() !== state.lastAuditSignature;
-    $("stale-banner").classList.toggle("hidden", !stale);
-    $("draft-hint").textContent = stale
-      ? "草稿已修改，结论区显示的是旧结论，请重新提交审计。"
-      : "";
+    let hint = "";
+    if (state.lastAuditSignature !== null) {
+      const stale = signature() !== state.lastAuditSignature;
+      $("stale-banner").classList.toggle("hidden", !stale);
+      if (stale) hint = "草稿已修改，结论区显示的是旧结论，请重新提交审计。";
+    }
+    if (state.lastPlanSignature !== null) {
+      const stale = planSignature() !== state.lastPlanSignature;
+      $("plan-stale-banner").classList.toggle("hidden", !stale);
+      if (stale) hint = "草稿或单位暴露代价已修改，配流单已失效，请重新生成。";
+    }
+    $("draft-hint").textContent = hint;
   }
 
   function clearResult() {
     $("result-card").classList.add("hidden");
     $("reject-card").classList.add("hidden");
+    $("plan-card").classList.add("hidden");
     $("stale-banner").classList.add("hidden");
+    $("plan-stale-banner").classList.add("hidden");
     $("draft-hint").textContent = "";
   }
 
@@ -311,9 +347,99 @@
 
   function renderRejection(err) {
     $("result-card").classList.add("hidden");
+    $("plan-card").classList.add("hidden");
     const card = $("reject-card");
     card.classList.remove("hidden");
     $("reject-msg").textContent = err || "输入无效。";
+    card.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  /* ---------------- 低暴露配流单渲染 ---------------- */
+
+  function planScenarioTitle(p) {
+    if (p.stage === "normal") return `情形 #${p.scenario} · 正常网络（无管段失效）`;
+    const r = p.removed;
+    const id = r.edge_id ? `（${r.edge_id}）` : "";
+    return `情形 #${p.scenario} · 第 ${r.position} 条管段${id}临时失效：${r.from} → ${r.to}`;
+  }
+
+  function renderPlanScenario(p) {
+    const wrap = document.createElement("div");
+    wrap.className = "plan-scenario";
+
+    const h = document.createElement("h3");
+    h.textContent = planScenarioTitle(p);
+    wrap.appendChild(h);
+
+    const meta = document.createElement("p");
+    meta.className = "tip";
+    meta.textContent = `本情形分配流量 ${fmt(p.flow_value)}（＝事故必须持续排出量），最低总代价 `;
+    const strong = document.createElement("strong");
+    strong.textContent = fmt(p.total_cost);
+    meta.appendChild(strong);
+    wrap.appendChild(meta);
+
+    const scroll = document.createElement("div");
+    scroll.className = "table-scroll";
+    const table = document.createElement("table");
+    table.className = "plan-table";
+    table.innerHTML =
+      "<thead><tr><th>#</th><th>管段编号</th><th>方向</th><th>容量上限</th>" +
+      "<th>单位暴露代价</th><th>分配流量</th><th>暴露代价</th></tr></thead>";
+    const tbody = document.createElement("tbody");
+    p.flows.forEach((f) => {
+      const tr = document.createElement("tr");
+      if (f.removed) tr.className = "row-removed";
+      const dir = `${f.from} → ${f.to}`;
+      const cells = [
+        String(f.position),
+        (f.edge_id || "—") + (f.removed ? "（已移除）" : ""),
+        dir,
+        fmt(f.capacity),
+        fmt(f.cost),
+        fmt(f.flow),
+        fmt(f.exposure),
+      ];
+      cells.forEach((c) => {
+        const td = document.createElement("td");
+        td.textContent = c;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    const tfoot = document.createElement("tfoot");
+    tfoot.innerHTML =
+      `<tr><td colspan="6" class="right">情形总代价（Σ 流量 × 单位暴露代价）</td>` +
+      `<td class="strong">${fmt(p.total_cost)}</td></tr>`;
+    table.appendChild(tfoot);
+    scroll.appendChild(table);
+    wrap.appendChild(scroll);
+    return wrap;
+  }
+
+  function renderPlan(data) {
+    const card = $("plan-card");
+    card.classList.remove("hidden");
+    $("plan-stale-banner").classList.add("hidden");
+
+    const blocked = !data.passed;
+    $("plan-blocked").classList.toggle("hidden", !blocked);
+    $("plan-summary").classList.toggle("hidden", blocked);
+    if (blocked) {
+      card.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+
+    const plans = data.plans || [];
+    $("plan-required").textContent = fmt(data.required_flow);
+    $("plan-count").textContent = String(plans.length);
+    const normal = plans.find((p) => p.stage === "normal");
+    $("plan-normal-cost").textContent = normal ? fmt(normal.total_cost) : "—";
+
+    const box = $("plan-scenarios");
+    box.innerHTML = "";
+    plans.forEach((p) => box.appendChild(renderPlanScenario(p)));
     card.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
@@ -346,6 +472,39 @@
     }
   }
 
+  /* ---------------- 生成低暴露配流单（真实业务 API） ---------------- */
+
+  async function submitPlan() {
+    const payload = planPayload();
+    $("btn-plan").disabled = true;
+    $("draft-hint").textContent = "正在调用服务端配流 API…";
+    try {
+      const resp = await fetch("/api/plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        renderRejection(data.error || `配流请求失败（HTTP ${resp.status}）`);
+        state.lastPlanSignature = null;
+        return;
+      }
+      // 服务端已按既有规则重新审计当前草稿：同步刷新审计结论
+      // （不放行时此处即展示首条失效管段与割集证据），并渲染配流单。
+      state.lastAuditSignature = signature();
+      state.lastPlanSignature = planSignature();
+      renderResult(data.audit);
+      renderPlan(data);
+    } catch (e) {
+      renderRejection("无法连接配流服务：" + e.message);
+      state.lastPlanSignature = null;
+    } finally {
+      $("btn-plan").disabled = false;
+      if ($("draft-hint").textContent.startsWith("正在")) $("draft-hint").textContent = "";
+    }
+  }
+
   /* ---------------- 载入 / 清空 ---------------- */
 
   function loadExample(ex) {
@@ -356,6 +515,7 @@
     state.nodes = ex.nodes.slice();
     state.edges = ex.edges.map((e) => ({ ...e }));
     state.lastAuditSignature = null;
+    state.lastPlanSignature = null;
     renderAll();
   }
 
@@ -367,6 +527,7 @@
     state.nodes = [];
     state.edges = [];
     state.lastAuditSignature = null;
+    state.lastPlanSignature = null;
     renderAll();
   }
 
@@ -381,12 +542,13 @@
   });
 
   $("btn-add-edge").addEventListener("click", () => {
-    state.edges.push({ id: "", from: "", to: "", capacity: "", maintainable: true });
+    state.edges.push({ id: "", from: "", to: "", capacity: "", cost: "", maintainable: true });
     renderEdges();
     markDirty();
   });
 
   $("btn-audit").addEventListener("click", submitAudit);
+  $("btn-plan").addEventListener("click", submitPlan);
   $("btn-example-pass").addEventListener("click", () => loadExample(EXAMPLE_PASS));
   $("btn-example-fail").addEventListener("click", () => loadExample(EXAMPLE_FAIL));
   $("btn-clear").addEventListener("click", clearAll);

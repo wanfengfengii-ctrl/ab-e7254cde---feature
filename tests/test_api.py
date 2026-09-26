@@ -98,3 +98,101 @@ def test_audit_non_json_body_400():
     r = client.post("/api/audit", content=b"not-json",
                     headers={"Content-Type": "application/json"})
     assert r.status_code == 400
+
+
+# ---------------- 低暴露配流单 POST /api/plan ----------------
+
+PLAN_PASS_PAYLOAD = {
+    "source": "S",
+    "sink": "T",
+    "required_flow": 95,
+    "nodes": ["A", "B"],
+    "edges": [
+        {"id": "E1", "from": "S", "to": "A", "capacity": 100, "maintainable": True, "cost": 2},
+        {"id": "E2", "from": "A", "to": "T", "capacity": 100, "maintainable": True, "cost": 2},
+        {"id": "E3", "from": "S", "to": "B", "capacity": 100, "maintainable": True, "cost": 1},
+        {"id": "E4", "from": "B", "to": "T", "capacity": 100, "maintainable": True, "cost": 1},
+    ],
+}
+
+
+def test_plan_pass_returns_all_scenarios():
+    r = client.post("/api/plan", json=PLAN_PASS_PAYLOAD)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is True
+    # 服务端先重新审计完整草稿，结论内嵌返回
+    assert body["audit"]["passed"] is True
+    plans = body["plans"]
+    # 正常网络（情形 0）+ 四条可检修管段逐一失效（情形 1..4）
+    assert [p["scenario"] for p in plans] == [0, 1, 2, 3, 4]
+    # 正常网络走低暴露 B 干线（单位代价 1）
+    assert [f["flow"] for f in plans[0]["flows"]] == [0, 0, 95, 95]
+    assert plans[0]["total_cost"] == 190
+    # 情形 1：E1 被移除，流量固定为零
+    p1 = plans[1]
+    assert p1["removed"]["position"] == 1
+    assert p1["flows"][0]["flow"] == 0 and p1["flows"][0]["removed"] is True
+    assert [f["flow"] for f in p1["flows"]] == [0, 0, 95, 95]
+    # 每种情形恰好排出必须持续排出量
+    for p in plans:
+        assert p["flow_value"] == 95
+        assert p["total_cost"] == sum(f["flow"] * f["cost"] for f in p["flows"])
+
+
+def test_plan_blocked_when_audit_fails_is_still_200():
+    """草稿不放行：HTTP 200 + passed=false，不生成配流单，保留首条失效管段与割集。"""
+    r = client.post("/api/plan", json=FAIL_PAYLOAD | {
+        "edges": [dict(e, cost=1) for e in FAIL_PAYLOAD["edges"]]
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passed"] is False
+    assert body["plans"] is None
+    f = body["audit"]["failure"]
+    assert f["position"] == 1 and f["edge_id"] == "E1"
+    assert f["cut"]["capacity"] == 90
+
+
+def test_plan_missing_cost_400():
+    r = client.post("/api/plan", json=PASS_PAYLOAD)  # 审计载荷没有 cost
+    assert r.status_code == 400
+    err = r.json()
+    assert "单位暴露代价" in err["error"]
+    assert err["field"].startswith("edges[") and err["field"].endswith("].cost")
+
+
+def test_plan_negative_cost_400():
+    payload = {
+        "source": "S", "sink": "T", "required_flow": 1, "nodes": [],
+        "edges": [{"from": "S", "to": "T", "capacity": 10, "maintainable": False, "cost": -1}],
+    }
+    r = client.post("/api/plan", json=payload)
+    assert r.status_code == 400
+    assert "不能为负数" in r.json()["error"]
+
+
+def test_plan_non_integer_cost_400():
+    payload = {
+        "source": "S", "sink": "T", "required_flow": 1, "nodes": [],
+        "edges": [{"from": "S", "to": "T", "capacity": 10, "maintainable": False, "cost": 2.5}],
+    }
+    r = client.post("/api/plan", json=payload)
+    assert r.status_code == 400
+    assert "非负整数" in r.json()["error"]
+
+
+def test_plan_draft_validation_takes_priority_400():
+    payload = {
+        "source": "S", "sink": "T", "required_flow": 1, "nodes": [],
+        "edges": [{"from": "S", "to": "幽灵", "capacity": 10, "maintainable": False}],
+    }
+    r = client.post("/api/plan", json=payload)
+    assert r.status_code == 400
+    assert "未在节点中定义" in r.json()["error"]
+
+
+def test_plan_non_json_body_400():
+    r = client.post("/api/plan", content=b"not-json",
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 400
