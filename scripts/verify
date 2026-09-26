@@ -3,10 +3,12 @@
 
 按顺序执行三类交付校验，任一步失败即以非零退出码报告：
 
-  1. 代码测试：pytest 测试套件（最大流/最小割、校验、API）；
+  1. 代码测试：pytest 测试套件（最大流/最小割、校验、API、低暴露配流）；
   2. 构建：字节码编译 + FastAPI 应用导入（确保可启动）；
-  3. 导排 API 冒烟：真实拉起 uvicorn，调用 /health 与 /api/audit，
-     覆盖达标放行、失效证据（首条失效管段 + 最小割）、非法输入 400。
+  3. 导排 API 冒烟：真实拉起 uvicorn，调用 /health、/api/audit 与
+     /api/allocate，覆盖达标放行、失效证据（首条失效管段 + 最小割）、
+     低暴露配流单（各情形恰好排出要求量、总代价、移除管段零流）、
+     非法输入 400。
 """
 from __future__ import annotations
 
@@ -29,12 +31,15 @@ PAYLOAD_PASS = {
     "required_flow": 95,
     "nodes": ["汇合点A", "汇合点B"],
     "edges": [
-        {"id": "E1", "from": "泄压源V-101", "to": "汇合点A", "capacity": 100, "maintainable": True},
-        {"id": "E2", "from": "汇合点A", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
-        {"id": "E3", "from": "泄压源V-101", "to": "汇合点B", "capacity": 100, "maintainable": True},
-        {"id": "E4", "from": "汇合点B", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True},
+        {"id": "E1", "from": "泄压源V-101", "to": "汇合点A", "capacity": 100, "maintainable": True, "exposure_cost": 1},
+        {"id": "E2", "from": "汇合点A", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True, "exposure_cost": 1},
+        {"id": "E3", "from": "泄压源V-101", "to": "汇合点B", "capacity": 100, "maintainable": True, "exposure_cost": 5},
+        {"id": "E4", "from": "汇合点B", "to": "焚烧炉F-1", "capacity": 100, "maintainable": True, "exposure_cost": 5},
     ],
 }
+
+# 配流冒烟：带单位暴露代价（经 A 低、经 B 高）；结构同 PAYLOAD_PASS。
+PAYLOAD_ALLOC = PAYLOAD_PASS
 
 PAYLOAD_FAIL = {
     "source": "泄压源V-101",
@@ -188,6 +193,61 @@ def run_smoke() -> bool:
         invalid_ok = status == 400 and bool(body.get("error"))
         _log(invalid_ok, f"节点引用无效返回 400（实际 HTTP {status}：{body.get('error', '')}）")
         ok &= invalid_ok
+
+        # 低暴露配流：服务端先重审，再为正常网络 + 每个可检修管段失效配流
+        status, body = _request("POST", f"{base}/api/allocate", PAYLOAD_ALLOC)
+        alloc_ok = False
+        alloc_detail = json.dumps(body, ensure_ascii=False)[:600]
+        if status == 200 and body.get("passed") is True and body.get("audit", {}).get("passed") is True:
+            cases = (body.get("allocations") or {}).get("cases") or []
+            if [c.get("case_no") for c in cases] == [1, 2, 3, 4, 5]:
+                alloc_ok = True
+                for ci, c in enumerate(cases):
+                    flows = c["flows"]
+                    # 每种情形各管段流量均满足 0≤f≤容量、总代价可复核
+                    total = 0.0
+                    for fi, f in enumerate(flows):
+                        if not (0 - EPS <= f["flow"] <= f["capacity"] + EPS):
+                            alloc_ok = False
+                        if ci >= 1 and fi == ci - 1:
+                            # 被移除管段流量固定为 0
+                            if not (f["removed"] is True and f["flow"] == 0):
+                                alloc_ok = False
+                        total += f["flow"] * f["exposure_cost"]
+                    if abs(total - c["total_cost"]) > EPS:
+                        alloc_ok = False
+                    # 源点净流出恰好等于必须持续排出量 95
+                    out_s = sum(f["flow"] for f in flows if f["from"] == PAYLOAD_ALLOC["source"])
+                    in_s = sum(f["flow"] for f in flows if f["to"] == PAYLOAD_ALLOC["source"])
+                    if abs((out_s - in_s) - 95) > EPS:
+                        alloc_ok = False
+                # 正常网络走低代价干线 95*(1+1)=190；E1 失效后走高代价 95*(5+5)=950
+                if cases[0]["total_cost"] != 190 or cases[1]["total_cost"] != 950:
+                    alloc_ok = False
+        _log(alloc_ok,
+             "低暴露配流单：先重审放行；5 个情形恰好排出 95、总代价正确(正常=190，E1失效=950)、移除管段零流",
+             "" if alloc_ok else f"HTTP {status} {alloc_detail}")
+        ok &= alloc_ok
+
+        # 配流请求里草稿不达标：HTTP 200 但不生成配流单，带回首条失效管段与割集
+        status, body = _request("POST", f"{base}/api/allocate", PAYLOAD_FAIL)
+        block_ok = (
+            status == 200
+            and body.get("passed") is False
+            and body.get("allocations") is None
+            and (body.get("audit") or {}).get("failure", {}).get("position") == 1
+        )
+        _log(block_ok, "草稿不放行时不生成配流单（继续返回首条失效管段与割集证据）",
+             "" if block_ok else json.dumps(body, ensure_ascii=False)[:600])
+        ok &= block_ok
+
+        # 配流请求里单位暴露代价非法：返回 400
+        bad_cost = json.loads(json.dumps(PAYLOAD_ALLOC))
+        bad_cost["edges"][0]["exposure_cost"] = -1
+        status, body = _request("POST", f"{base}/api/allocate", bad_cost)
+        cost_ok = status == 400 and "暴露代价" in (body.get("error") or "")
+        _log(cost_ok, f"单位暴露代价非法返回 400（实际 HTTP {status}：{body.get('error', '')}）")
+        ok &= cost_ok
     finally:
         server.terminate()
         try:

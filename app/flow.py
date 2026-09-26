@@ -1,4 +1,4 @@
-"""最大流 / 最小割引擎与检修审计逻辑。
+"""最大流 / 最小割引擎、检修审计逻辑与低暴露配流。
 
 规则（对应业务要求）：
 
@@ -10,14 +10,21 @@
 * 失效时按管段录入顺序返回第一条不达标管段，并依据最大流 / 最小割定理，
   从残余网络给出可复核的源侧割集、焚烧端侧节点及割集容量。
 
+审计通过后，安全工程师为每条管段录入**非负整数单位暴露代价**，
+在正常网络与每个单点失效残余网络中，各分配**恰好等于必须持续排出量**
+的流量（被移除管段流量固定为 0），先最小化总暴露代价，再按管段录入
+顺序的流量序列字典序稳定决胜（见 :func:`allocate_network`）。
+
 注意：本模块用“流量”而不是“路径条数”下结论——存在多条路径并不保证
 总排量达标，共享瓶颈会限制总流量。
 """
 from __future__ import annotations
 
+import heapq
 import sys
 from collections import deque
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Optional
 
 # 检修网络节点规模通常不大，放宽递归深度以支持较长的增广链。
@@ -324,6 +331,363 @@ def audit_network(
         "scenarios": scenarios,
         "failure": failure,
     }
+
+
+# ---------------------------------------------------------------------------
+# 低暴露配流：最小费用流（整数精确）+ 录入顺序流量序列字典序稳定决胜
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _CFEdge:
+    """连续最短路费用流内部边（带反向边索引）。"""
+
+    to: int
+    rev: int
+    cap: int
+    cost: int
+
+
+class MinCostFlow:
+    """容量、费用、流量均为非负整数的逐次最短路（SSP）最小费用流。
+
+    不假设残量网络无负环：初始网络无反向容量，费用均非负；每轮增广后
+    用 Johnson 势函数保证边权（reduced cost）非负，Dijkstra 即可求解。
+    取流后通过 ``flow_on`` 读回每条原始管段上的净流量。
+    """
+
+    def __init__(self, n: int):
+        self.n = n
+        self.g: list[list[_CFEdge]] = [[] for _ in range(n)]
+        self._origin: list[tuple[int, int]] = []  # (起点, 正向边在 g[u] 中的下标)
+
+    def add_edge(self, u: int, v: int, cap: int, cost: int) -> int:
+        idx = len(self._origin)
+        fwd = _CFEdge(to=v, rev=len(self.g[v]), cap=cap, cost=cost)
+        bak = _CFEdge(to=u, rev=len(self.g[u]), cap=0, cost=-cost)
+        self.g[u].append(fwd)
+        self.g[v].append(bak)
+        self._origin.append((u, len(self.g[u]) - 1))
+        return idx
+
+    def min_cost_flow(self, s: int, t: int, required: int) -> Optional[int]:
+        """发送恰好 ``required`` 单位流量；不可行返回 None，可行返回总费用。"""
+        n = self.n
+        potential = [0] * n  # Johnson 势函数
+        total_cost = 0
+        remaining = required
+        INF = None  # 用 None 表示不可达，避免大整数常量
+        while remaining > 0:
+            dist: list[Optional[int]] = [INF] * n
+            prev_v: list[int] = [-1] * n
+            prev_e: list[int] = [-1] * n
+            dist[s] = 0
+            pq: list[tuple[int, int]] = [(0, s)]
+            while pq:
+                d, u = heapq.heappop(pq)
+                if d != dist[u]:
+                    continue
+                for ei, e in enumerate(self.g[u]):
+                    if e.cap <= 0:
+                        continue
+                    nd = d + e.cost + potential[u] - potential[e.to]
+                    if dist[e.to] is None or nd < dist[e.to]:
+                        dist[e.to] = nd
+                        prev_v[e.to] = u
+                        prev_e[e.to] = ei
+                        heapq.heappush(pq, (nd, e.to))
+            if dist[t] is None:
+                return None  # 残余网络已无法继续增广
+            for v in range(n):
+                if dist[v] is not None:
+                    potential[v] += dist[v]
+            # 沿最短路尽量增广
+            add = remaining
+            v = t
+            while v != s:
+                add = min(add, self.g[prev_v[v]][prev_e[v]].cap)
+                v = prev_v[v]
+            v = t
+            while v != s:
+                e = self.g[prev_v[v]][prev_e[v]]
+                e.cap -= add
+                self.g[v][e.rev].cap += add
+                v = prev_v[v]
+            total_cost += add * potential[t]  # 增广后的势差即原始最短路费用
+            remaining -= add
+        return total_cost
+
+    def flow_on(self, edge_index: int) -> int:
+        """原始正向管段上的净流量 = 反向残量边上的容量。"""
+        u, ei = self._origin[edge_index]
+        fwd = self.g[u][ei]
+        return self.g[fwd.to][fwd.rev].cap
+
+
+def _nonneg_int(raw, field: str) -> int:
+    """校验“非负整数”：接受 int 与无指数、无尾数的小数字面量（如 3.0）。"""
+    if isinstance(raw, bool):
+        raise NetworkValidationError(f"{field}必须是非负整数", field)
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float):
+        if not float(raw).is_integer():
+            raise NetworkValidationError(f"{field}必须是非负整数", field)
+        value = int(raw)
+    elif isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        try:
+            value = int(text)
+        except ValueError:
+            try:
+                dec = Decimal(text)
+            except Exception:
+                raise NetworkValidationError(f"{field}必须是非负整数", field)
+            if dec != dec.to_integral_value():
+                raise NetworkValidationError(f"{field}必须是非负整数", field)
+            value = int(dec)
+    else:
+        raise NetworkValidationError(f"{field}必须是非负整数", field)
+    if value < 0:
+        raise NetworkValidationError(f"{field}不能为负数", field)
+    return value
+
+
+def _flow_units(raw, field: str = "事故持续排出流量") -> int:
+    """把必须持续排出量换算为整数流量单位。
+
+    容量与要求量沿用审计侧的正数（有限）规则；为保证配流为整数，
+    统一按最多 6 位小数放大为整数，超过 6 位小数视为非法（不做静默截断）。
+    """
+    import math
+
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise NetworkValidationError(f"{field}必须是正数", field)
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise NetworkValidationError(f"{field}必须是大于 0 的有限数值", field)
+    scaled = Decimal(str(value)).scaleb(6)
+    if scaled != scaled.to_integral_value():
+        raise NetworkValidationError(f"{field}最多保留 6 位小数", field)
+    units = int(scaled)
+    if units <= 0:
+        raise NetworkValidationError(f"{field}必须大于 0", field)
+    return units
+
+
+def allocate_network(
+    *,
+    source: str,
+    sink: str,
+    nodes: list[str],
+    edges: list[dict],
+    required_flow: float,
+) -> dict:
+    """审计通过后生成低暴露配流单。
+
+    服务端语义（与业务约定一一对应）：
+
+    1. **先按既有规则重新审计完整草稿**：方向、容量、节点引用等全部
+       重新校验，并在正常网络与每个单点失效残余网络上重跑最大流；
+    2. 仅当审计放行（``passed``）时才生成配流单，否则返回审计结论，
+       ``allocations`` 为 ``None``——调用方继续展示首条失效管段与割集；
+    3. 审计通过时，在正常网络与**每条可检修管段单独失效**的残余网络中，
+       分别用最小费用流发送**恰好** ``required_flow`` 的流量；被移除管段
+       流量固定为 0。每种情形返回各管段流量、总代价与情形编号；
+    4. 在所有满足方向、容量与汇合节点守恒的配流中，先取总代价最低，
+       再按管段录入顺序的流量序列字典序决胜，得到唯一稳定配流单。
+
+    ``edges`` 每项在审计字段之外还需提供
+    ``"exposure_cost": <非负整数>``。
+    """
+    # 1) 既有规则完整重审（内部含全部业务校验与 400 级异常）
+    audit = audit_network(
+        source=source,
+        sink=sink,
+        nodes=nodes,
+        edges=edges,
+        required_flow=required_flow,
+    )
+
+    # 2) 草稿不放行则不得生成配流单：直接带回本次重审结论（首条失效
+    #    管段与割集证据），此时不强制要求代价已填写。
+    if not audit["passed"]:
+        return {
+            "passed": False,
+            "required_flow": audit["required_flow"],
+            "audit": audit,
+            "allocations": None,
+        }
+
+    required_units = _flow_units(required_flow)
+
+    # 3) 审计放行后重建规范网络，并校验每条管段的非负整数单位暴露代价
+    clean_source = str(source).strip()
+    clean_sink = str(sink).strip()
+    node_set: set[str] = {clean_source, clean_sink}
+    for raw in nodes:
+        node_set.add(str(raw).strip())
+    all_nodes = sorted(node_set)
+    index_of = {name: i for i, name in enumerate(all_nodes)}
+
+    clean_edges: list[dict] = []
+    for i, raw in enumerate(edges):
+        cost = _nonneg_int(
+            raw.get("exposure_cost") if isinstance(raw, dict) else None,
+            f"第 {i + 1} 条管段单位暴露代价",
+        )
+        cap_units = _capacity_units(raw["capacity"], f"第 {i + 1} 条管段最大流量")
+        clean_edges.append(
+            {
+                "index": i,
+                "position": i + 1,
+                "id": (str(raw.get("id")).strip()
+                       if isinstance(raw.get("id"), str) and raw.get("id").strip() else None),
+                "from": str(raw["from"]).strip(),
+                "to": str(raw["to"]).strip(),
+                "capacity": cap_units,
+                "cost": cost,
+                "maintainable": bool(raw.get("maintainable", False)),
+            }
+        )
+
+    def _solve_case(case_no: int, removed_index: Optional[int]) -> dict:
+        """在一张全新网络上求最小费用整数流，并施加录入顺序字典序决胜。"""
+
+        def build(bounds: dict[int, int], probe: Optional[tuple[int, int]] = None):
+            """按边界重建费用流网络。
+
+            已决胜管段容量直接收紧为其边界；``probe`` 为 (管段序号, 试探上界)，
+            供二分查找该管段在总费用最优前提下可取的最小流量。
+            被移除管段不入网（流量固定为 0）。
+            """
+            mcf = MinCostFlow(len(all_nodes))
+            refs: list[Optional[int]] = []
+            for g in clean_edges:
+                if g["index"] == removed_index:
+                    refs.append(None)
+                    continue
+                cap = g["capacity"]
+                if g["index"] in bounds:
+                    cap = bounds[g["index"]]
+                elif probe is not None and g["index"] == probe[0]:
+                    cap = probe[1]
+                ref = mcf.add_edge(
+                    index_of[g["from"]], index_of[g["to"]], cap, g["cost"]
+                )
+                refs.append(ref)
+            return mcf, refs
+
+        mcf, _ = build({})
+        min_total = mcf.min_cost_flow(
+            index_of[clean_source], index_of[clean_sink], required_units
+        )
+        # 审计已保证每种残余网络可达 required_flow，这里仅作防御
+        if min_total is None:
+            raise NetworkValidationError(
+                "配流不可行：当前网络无法送出事故要求流量（请先通过检修审计）",
+                None,
+            )
+
+        # 字典序决胜：在总费用最优的多解中，按录入顺序依次令每条管段的
+        # 流量尽量小（把该管段容量上界收紧后，仍以 min_total 送出要求量）。
+        bounds: dict[int, int] = {}
+        for e in clean_edges:
+            if e["index"] == removed_index:
+                continue  # 被移除管段流量固定为 0
+            k = e["index"]
+            # 已固定前面管段后重解，取该解中 f_k 作为二分上界（它一定是
+            # 受限可行集里某个最优解的取值，故不小于真正的最小 f_k）。
+            base, base_refs = build(bounds)
+            base_total = base.min_cost_flow(
+                index_of[clean_source], index_of[clean_sink], required_units
+            )
+            assert base_total == min_total
+            f_k = base.flow_on(base_refs[k])
+            lo, hi, best = 0, f_k, f_k
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                trial, _ = build(bounds, (k, mid))
+                got = trial.min_cost_flow(
+                    index_of[clean_source], index_of[clean_sink], required_units
+                )
+                if got is not None and got == min_total:
+                    best, hi = mid, mid - 1
+                else:
+                    lo = mid + 1
+            bounds[k] = best
+
+        # 用最终全部边界重解一次，得到决胜后的稳定配流
+        final, final_refs = build(bounds)
+        total = final.min_cost_flow(
+            index_of[clean_source], index_of[clean_sink], required_units
+        )
+
+        flows: list[dict] = []
+        for e in clean_edges:
+            ref = final_refs[e["index"]]
+            flow_units = 0 if ref is None else final.flow_on(ref)
+            flows.append(
+                {
+                    "index": e["index"],
+                    "position": e["position"],
+                    "id": e["id"],
+                    "from": e["from"],
+                    "to": e["to"],
+                    "capacity": _num(e["capacity"] / _FLOW_SCALE),
+                    "flow": _num(flow_units / _FLOW_SCALE),
+                    "exposure_cost": e["cost"],
+                    "removed": e["index"] == removed_index,
+                }
+            )
+        return {
+            "case_no": case_no,
+            "stage": "normal" if removed_index is None else "single_failure",
+            "edge_index": None if removed_index is None else removed_index,
+            "position": None if removed_index is None else removed_index + 1,
+            "edge_id": None if removed_index is None
+            else next(e["id"] for e in clean_edges if e["index"] == removed_index),
+            "required_flow": audit["required_flow"],
+            "total_cost": _num(total / _FLOW_SCALE),
+            "flows": flows,
+        }
+
+    cases = [_solve_case(1, None)]
+    case_no = 2
+    for e in clean_edges:
+        if e["maintainable"]:
+            cases.append(_solve_case(case_no, e["index"]))
+            case_no += 1
+
+    return {
+        "passed": True,
+        "required_flow": audit["required_flow"],
+        "audit": audit,
+        "allocations": {
+            "flow_unit_scale": _FLOW_SCALE,
+            "tie_break": "总暴露代价最低；并列时按管段录入顺序的流量序列字典序（前者优先取小）",
+            "cases": cases,
+        },
+    }
+
+
+_FLOW_SCALE = 10 ** 6
+
+
+def _capacity_units(raw, field: str) -> int:
+    """容量按与要求量相同的 6 位小数刻度换算为整数单位。"""
+    import math
+
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise NetworkValidationError(f"{field}必须大于 0", field)
+    scaled = Decimal(str(value)).scaleb(6)
+    if scaled != scaled.to_integral_value():
+        raise NetworkValidationError(f"{field}最多保留 6 位小数", field)
+    units = int(scaled)
+    if units <= 0:
+        raise NetworkValidationError(f"{field}必须大于 0", field)
+    return units
 
 
 def _num(x: float) -> float:

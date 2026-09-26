@@ -11,25 +11,27 @@
 
   const state = {
     nodes: [],          // 汇合节点名称（不含源/汇）
-    edges: [],          // {id, from, to, capacity, maintainable}
-    lastAuditSignature: null,  // 上次成功提交时草稿的签名
+    edges: [],          // {id, from, to, capacity, exposureCost, maintainable}
+    lastAuditSignature: null,  // 上次成功提交审计时草稿的签名
+    lastAllocation: null,      // {signature, data}：上次生成的配流单
   };
 
   /* ---------------- 示例数据 ---------------- */
 
   // 达标示例：两条 100 容量干线在源/汇之间并联，要求 95，
   // 任一可检修管段失效后仍至少剩 100 容量。
+  // 单位暴露代价：上干线（经汇合点A）低于下干线（经汇合点B）。
   const EXAMPLE_PASS = {
     source: "泄压源V-101",
     sink: "焚烧炉F-1",
     required_flow: 95,
     nodes: ["汇合点A", "汇合点B"],
     edges: [
-      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, maintainable: true },
-      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 100, maintainable: true },
-      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E5", from: "汇合点A", to: "汇合点B", capacity: 40, maintainable: false },
+      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, exposure_cost: 1, maintainable: true },
+      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, exposure_cost: 1, maintainable: true },
+      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 100, exposure_cost: 5, maintainable: true },
+      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 100, exposure_cost: 5, maintainable: true },
+      { id: "E5", from: "汇合点A", to: "汇合点B", capacity: 40, exposure_cost: 2, maintainable: false },
     ],
   };
 
@@ -41,10 +43,10 @@
     required_flow: 95,
     nodes: ["汇合点A", "汇合点B"],
     edges: [
-      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, maintainable: true },
-      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, maintainable: true },
-      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 90, maintainable: true },
-      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 90, maintainable: true },
+      { id: "E1", from: "泄压源V-101", to: "汇合点A", capacity: 100, exposure_cost: 1, maintainable: true },
+      { id: "E2", from: "汇合点A", to: "焚烧炉F-1", capacity: 100, exposure_cost: 1, maintainable: true },
+      { id: "E3", from: "泄压源V-101", to: "汇合点B", capacity: 90, exposure_cost: 5, maintainable: true },
+      { id: "E4", from: "汇合点B", to: "焚烧炉F-1", capacity: 90, exposure_cost: 5, maintainable: true },
     ],
   };
 
@@ -121,6 +123,17 @@
       capInput.addEventListener("input", () => { edge.capacity = capInput.value; markDirty(); });
       tdCap.appendChild(capInput);
 
+      const tdCost = document.createElement("td");
+      const costInput = document.createElement("input");
+      costInput.type = "number";
+      costInput.min = "0";
+      costInput.step = "1";
+      costInput.value = edge.exposureCost === undefined || edge.exposureCost === null ? "" : edge.exposureCost;
+      costInput.placeholder = "如：0";
+      costInput.title = "非负整数单位暴露代价；事故配流时经过该管段每单位流量的暴露代价";
+      costInput.addEventListener("input", () => { edge.exposureCost = costInput.value; markDirty(); });
+      tdCost.appendChild(costInput);
+
       const tdMaint = document.createElement("td");
       tdMaint.className = "center";
       const cb = document.createElement("input");
@@ -139,7 +152,7 @@
       delBtn.addEventListener("click", () => { state.edges.splice(i, 1); renderEdges(); markDirty(); });
       tdDel.appendChild(delBtn);
 
-      tr.append(tdNo, tdId, tdFrom, tdArrow, tdTo, tdCap, tdMaint, tdDel);
+      tr.append(tdNo, tdId, tdFrom, tdArrow, tdTo, tdCap, tdCost, tdMaint, tdDel);
       body.appendChild(tr);
     });
   }
@@ -163,29 +176,42 @@
         from: (e.from || "").trim(),
         to: (e.to || "").trim(),
         capacity: e.capacity === "" || e.capacity === null ? null : Number(e.capacity),
+        // 配流 API 要求非负整数；空串传 null 由服务端给出明确 400 提示
+        exposure_cost: e.exposureCost === "" || e.exposureCost === undefined || e.exposureCost === null
+          ? null
+          : Number(e.exposureCost),
         maintainable: !!e.maintainable,
       })),
     };
   }
 
-  // 用稳定签名判断“草稿是否在上次审计后变化”
+  // 用稳定签名判断“草稿是否在上次审计 / 配流后变化”
   function signature() {
     return JSON.stringify(currentPayload());
   }
 
   function markDirty() {
-    if (state.lastAuditSignature === null) return;
-    const stale = signature() !== state.lastAuditSignature;
-    $("stale-banner").classList.toggle("hidden", !stale);
-    $("draft-hint").textContent = stale
-      ? "草稿已修改，结论区显示的是旧结论，请重新提交审计。"
-      : "";
+    const sig = signature();
+    if (state.lastAuditSignature !== null) {
+      const stale = sig !== state.lastAuditSignature;
+      $("stale-banner").classList.toggle("hidden", !stale);
+      $("draft-hint").textContent = stale
+        ? "草稿已修改，结论区显示的是旧结论，请重新提交审计。"
+        : "";
+    }
+    // 草稿或任一代价修改后，旧配流单立即失效
+    if (state.lastAllocation !== null) {
+      const allocStale = sig !== state.lastAllocation.signature;
+      if (allocStale) $("alloc-stale-banner").classList.remove("hidden");
+    }
   }
 
   function clearResult() {
     $("result-card").classList.add("hidden");
     $("reject-card").classList.add("hidden");
     $("stale-banner").classList.add("hidden");
+    $("allocation-panel").classList.add("hidden");
+    $("alloc-stale-banner").classList.add("hidden");
     $("draft-hint").textContent = "";
   }
 
@@ -306,7 +332,108 @@
       note.classList.add("hidden");
     }
 
+    // 低暴露配流单仅在审计通过且当前草稿存在有效配流时展示
+    const allocPanel = $("allocation-panel");
+    if (passed) {
+      allocPanel.classList.remove("hidden");
+      if (state.lastAllocation && state.lastAllocation.signature === signature()) {
+        renderAllocation(state.lastAllocation.data);
+      } else {
+        renderAllocationEmpty();
+      }
+    } else {
+      allocPanel.classList.add("hidden");
+    }
+
     card.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  /* ---------------- 低暴露配流单渲染 ---------------- */
+
+  function caseTitle(c) {
+    if (c.stage === "normal") return `情形 ${c.case_no}：正常网络`;
+    const id = c.edge_id ? `（${c.edge_id}）` : "";
+    return `情形 ${c.case_no}：第 ${c.position} 条${id}失效`;
+  }
+
+  function renderAllocationEmpty() {
+    $("alloc-stale-banner").classList.add("hidden");
+    $("alloc-required").textContent = fmt(currentPayload().required_flow);
+    $("alloc-rule").textContent = "审计已通过。点击上方“生成低暴露配流单”，服务端将重新审计本草稿，并在正常网络与每条可检修管段单独失效后的残余网络中分别配流。";
+    $("alloc-head").innerHTML = "";
+    $("alloc-body").innerHTML = '<tr><td class="center tip">尚未生成配流单。</td></tr>';
+    $("alloc-foot").innerHTML = "";
+  }
+
+  function renderAllocation(data) {
+    const alloc = data.allocations;
+    const cases = alloc.cases;
+    $("alloc-stale-banner").classList.add("hidden");
+    $("alloc-required").textContent = fmt(data.required_flow);
+    $("alloc-rule").textContent =
+      `决胜规则：${alloc.tie_break}。各情形独立求解，均恰好排出 ${fmt(data.required_flow)}，总代价 = Σ(管段流量 × 单位暴露代价)。`;
+
+    // 表头：管段信息 + 每个情形一列
+    const trh = document.createElement("tr");
+    ["管段（录入顺序）", "容量", "单位代价"].forEach((t) => {
+      const th = document.createElement("th");
+      th.textContent = t;
+      trh.appendChild(th);
+    });
+    cases.forEach((c) => {
+      const th = document.createElement("th");
+      th.textContent = caseTitle(c);
+      trh.appendChild(th);
+    });
+    $("alloc-head").innerHTML = "";
+    $("alloc-head").appendChild(trh);
+
+    // 表体：每行一条管段，每格为该情形下的流量
+    const body = $("alloc-body");
+    body.innerHTML = "";
+    const edgeCount = cases[0].flows.length;
+    for (let i = 0; i < edgeCount; i++) {
+      const tr = document.createElement("tr");
+      const first = cases[0].flows[i];
+      const tdEdge = document.createElement("td");
+      tdEdge.textContent = `#${first.position} ${first.id ? first.id + " " : ""}${first.from} → ${first.to}`;
+      const tdCap = document.createElement("td");
+      tdCap.textContent = fmt(first.capacity);
+      const tdCost = document.createElement("td");
+      tdCost.textContent = String(first.exposure_cost);
+      tr.append(tdEdge, tdCap, tdCost);
+      cases.forEach((c) => {
+        const f = c.flows[i];
+        const td = document.createElement("td");
+        td.className = "center";
+        if (f.removed) {
+          td.classList.add("alloc-removed");
+          td.textContent = "—";
+          td.title = "该管段在本情形被移除，流量固定为 0";
+        } else {
+          td.textContent = fmt(f.flow);
+          if (f.flow > 0) td.classList.add("alloc-active");
+        }
+        tr.appendChild(td);
+      });
+      body.appendChild(tr);
+    }
+
+    // 表尾：每列总暴露代价
+    const trf = document.createElement("tr");
+    const tdLabel = document.createElement("td");
+    tdLabel.colSpan = 3;
+    tdLabel.className = "right strong";
+    tdLabel.textContent = "总暴露代价";
+    trf.appendChild(tdLabel);
+    cases.forEach((c) => {
+      const td = document.createElement("td");
+      td.className = "center strong alloc-cost";
+      td.textContent = fmt(c.total_cost);
+      trf.appendChild(td);
+    });
+    $("alloc-foot").innerHTML = "";
+    $("alloc-foot").appendChild(trf);
   }
 
   function renderRejection(err) {
@@ -346,6 +473,40 @@
     }
   }
 
+  async function submitAllocation() {
+    const payload = currentPayload();
+    $("btn-allocate").disabled = true;
+    $("draft-hint").textContent = "正在调用服务端低暴露配流 API（先重新审计再配流）…";
+    try {
+      const resp = await fetch("/api/allocate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        renderRejection(data.error || `配流请求失败（HTTP ${resp.status}）`);
+        return;
+      }
+      // 服务端先重审：不放行则不得生成配流单，继续展示首条失效管段与割集证据
+      if (!data.passed) {
+        state.lastAuditSignature = signature();
+        state.lastAllocation = null;
+        renderResult(data.audit);  // 失败面板含首条失效管段与最小割证据
+        $("draft-hint").textContent = "服务端重审未放行，未生成配流单。";
+        return;
+      }
+      state.lastAuditSignature = signature();
+      state.lastAllocation = { signature: signature(), data };
+      renderResult(data.audit);
+    } catch (e) {
+      renderRejection("无法连接配流服务：" + e.message);
+    } finally {
+      $("btn-allocate").disabled = false;
+      if ($("draft-hint").textContent.startsWith("正在")) $("draft-hint").textContent = "";
+    }
+  }
+
   /* ---------------- 载入 / 清空 ---------------- */
 
   function loadExample(ex) {
@@ -354,8 +515,16 @@
     $("in-sink").value = ex.sink;
     $("in-required").value = String(ex.required_flow);
     state.nodes = ex.nodes.slice();
-    state.edges = ex.edges.map((e) => ({ ...e }));
+    state.edges = ex.edges.map((e) => ({
+      id: e.id,
+      from: e.from,
+      to: e.to,
+      capacity: e.capacity,
+      exposureCost: e.exposure_cost !== undefined ? e.exposure_cost : 0,
+      maintainable: !!e.maintainable,
+    }));
     state.lastAuditSignature = null;
+    state.lastAllocation = null;
     renderAll();
   }
 
@@ -367,6 +536,7 @@
     state.nodes = [];
     state.edges = [];
     state.lastAuditSignature = null;
+    state.lastAllocation = null;
     renderAll();
   }
 
@@ -381,12 +551,13 @@
   });
 
   $("btn-add-edge").addEventListener("click", () => {
-    state.edges.push({ id: "", from: "", to: "", capacity: "", maintainable: true });
+    state.edges.push({ id: "", from: "", to: "", capacity: "", exposureCost: "", maintainable: true });
     renderEdges();
     markDirty();
   });
 
   $("btn-audit").addEventListener("click", submitAudit);
+  $("btn-allocate").addEventListener("click", submitAllocation);
   $("btn-example-pass").addEventListener("click", () => loadExample(EXAMPLE_PASS));
   $("btn-example-fail").addEventListener("click", () => loadExample(EXAMPLE_FAIL));
   $("btn-clear").addEventListener("click", clearAll);

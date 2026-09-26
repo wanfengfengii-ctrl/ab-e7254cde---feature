@@ -165,6 +165,15 @@ tr.row-fail td { font-weight: 600; }
 .cut-detail summary { cursor: pointer; color: var(--brand); font-weight: 600; padding: 6px 0; }
 .cut-detail .cut-grid { margin-top: 10px; }
 
+/* 低暴露配流单矩阵 */
+.alloc-table th { text-align: center; vertical-align: bottom; }
+.alloc-table td { text-align: center; }
+.alloc-table td:first-child { text-align: left; white-space: normal; min-width: 180px; }
+.alloc-table td.alloc-active { background: #eef6f1; font-weight: 600; color: #145c38; }
+.alloc-table td.alloc-removed { color: #a7b0bc; background: #f7f8fa; }
+.alloc-table tfoot td { background: #f5f7fa; border-top: 2px solid #cdd5e0; }
+.alloc-table .alloc-cost { color: var(--brand-dark); }
+
 #reject-card { border-color: #e8b8b2; }
 .reject { color: var(--fail); }
 .reject-msg { font-size: 14.5px; background: var(--fail-bg); border-radius: 6px; padding: 10px 14px; margin: 0 0 8px; }

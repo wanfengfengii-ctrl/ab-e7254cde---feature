@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .flow import NetworkValidationError, audit_network
+from .flow import NetworkValidationError, allocate_network, audit_network
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -19,7 +19,8 @@ app = FastAPI(
     description=(
         "录入泄压源、安全焚烧端、汇合节点与带方向/容量/检修标记的管段，"
         "在正常网络及每条可检修管段临时失效后的残余网络上独立求最大流，"
-        "判定事故持续排出流量是否始终可达。"
+        "判定事故持续排出流量是否始终可达；审计通过后可按非负整数单位"
+        "暴露代价生成事故泄压低暴露配流单。"
     ),
 )
 
@@ -53,6 +54,36 @@ async def audit(request: Request) -> dict:
         return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象", "field": None})
 
     result = audit_network(
+        source=payload.get("source"),
+        sink=payload.get("sink"),
+        nodes=payload.get("nodes", []),
+        edges=payload.get("edges", []),
+        required_flow=payload.get("required_flow"),
+    )
+    result["service"] = "flare-audit"
+    result["version"] = __version__
+    return result
+
+
+@app.post("/api/allocate")
+async def allocate(request: Request) -> dict:
+    """审计通过后生成低暴露配流单。
+
+    服务端先按既有规则对完整草稿**重新审计**（正常网络 + 每条可检修管段
+    单独失效的最大流），通过后在正常网络与每个失效残余网络中分别分配
+    恰好等于必须持续排出量的流量，被移除管段固定为 0；最小化总暴露代价，
+    并列时按管段录入顺序的流量序列字典序稳定决胜。草稿不放行则
+    ``allocations`` 为 ``null``，响应同时带回本次重审结论（首条失效管段
+    与割集证据）。每条管段需携带非负整数 ``exposure_cost``。
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "请求体必须是合法 JSON", "field": None})
+    if not isinstance(payload, dict):
+        return JSONResponse(status_code=400, content={"error": "请求体必须是 JSON 对象", "field": None})
+
+    result = allocate_network(
         source=payload.get("source"),
         sink=payload.get("sink"),
         nodes=payload.get("nodes", []),
